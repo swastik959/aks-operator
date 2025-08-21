@@ -61,7 +61,7 @@ jobs:
             gh workflow run "Manual Trigger for Auto Bump" \
               --repo "$CHARTS_REPO" \
               --ref dev-v2.12 \
-              -F chart=rancher-gke-operator \
+              -F chart=rancher-aks-operator \
               -F branch=dev-v2.12 \
               -F version-override=$VERSION_OVERRIDE
               
