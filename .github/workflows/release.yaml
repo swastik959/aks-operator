@@ -30,7 +30,7 @@ jobs:
 
       - name: Test Dispatch to rancher/charts
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # Use regular GitHub token instead of App token
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}  # Use regular GitHub token instead of App token
         run: |
           TAG_NAME="${{ steps.set-tag.outputs.tag_name }}"
           echo "Testing dispatch with tag: $TAG_NAME"
