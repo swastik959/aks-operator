@@ -50,7 +50,7 @@ jobs:
           
           # For testing, let's try to dispatch to your forked charts repo
           # Replace 'your-username' with your actual GitHub username
-          CHARTS_REPO="your-username/charts"  # Change this to your fork
+          CHARTS_REPO="swastik959/charts"  # Change this to your fork
           
           echo "Attempting to dispatch to $CHARTS_REPO..."
           
