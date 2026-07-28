@@ -30,7 +30,8 @@ func GetClusterKubeConfig(ctx context.Context, secretsCache wranglerv1.SecretCac
 
 	h := Handler{
 		azureClients: azureClients{
-			clustersClient: clustersClient,
+			tokenCredential: clientSecretCredential,
+			clustersClient:  clustersClient,
 		},
 	}
 	return h.getClusterKubeConfig(ctx, spec)
@@ -58,7 +59,8 @@ func BuildUpstreamClusterState(ctx context.Context, secretsCache wranglerv1.Secr
 		secretsCache: secretsCache,
 		secrets:      secretClient,
 		azureClients: azureClients{
-			clustersClient: clustersClient,
+			tokenCredential: clientSecretCredential,
+			clustersClient:  clustersClient,
 		},
 	}
 	return h.buildUpstreamClusterState(ctx, credentials, spec)

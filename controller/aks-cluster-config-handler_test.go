@@ -2,9 +2,15 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"io"
+	"net/http"
 	"strings"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v5"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
@@ -22,6 +28,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -46,6 +54,42 @@ users:
     client-certificate-data: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCnRlc3QKLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=
     client-key-data: LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVktLS0tLQp0ZXN0Ci0tLS0tRU5EIFJTQSBQUklWQVRFIEtFWS0tLS0tCg==
     token: dGVzdA==`
+
+// kubeconfigExecYAML is the kubeconfig returned by AKS for the cluster user of a Microsoft Entra ID enabled
+// cluster. Authentication is delegated to the kubelogin exec plugin.
+const kubeconfigExecYAML = `
+apiVersion: v1
+clusters:
+- cluster:
+    certificate-authority-data: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCnRlc3QKLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=
+    server: https://test.com
+  name: test
+contexts:
+- context:
+    cluster: test
+    user: test
+  name: test
+current-context: test
+kind: Config
+preferences: {}
+users:
+- name: test
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1beta1
+      command: kubelogin
+      args:
+      - get-token
+      - --environment
+      - AzurePublicCloud
+      - --server-id
+      - test-server-id
+      - --client-id
+      - test-client-id
+      - --tenant-id
+      - test-tenant-id
+      - --login
+      - devicecode`
 
 var _ = Describe("importCluster", func() {
 	var (
@@ -211,7 +255,178 @@ var _ = Describe("getClusterKubeConfig", func() {
 		_, err := handler.getClusterKubeConfig(ctx, aksConfigSpec)
 		Expect(err).To(HaveOccurred())
 	})
+
+	When("local accounts are disabled", func() {
+		var tokenCredential *fakeTokenCredential
+
+		BeforeEach(func() {
+			tokenCredential = &fakeTokenCredential{token: azcore.AccessToken{Token: "test-token"}}
+			handler.azureClients.tokenCredential = tokenCredential
+
+			clusterClientMock.EXPECT().GetAccessProfile(gomock.Any(), aksConfigSpec.ResourceGroup, aksConfigSpec.ClusterName, "clusterAdmin", nil).
+				Return(armcontainerservice.ManagedClustersClientGetAccessProfileResponse{}, localAccountsDisabledError())
+		})
+
+		It("should return a kubeconfig authenticated with a Microsoft Entra ID token", func() {
+			clusterClientMock.EXPECT().ListClusterUserCredentials(gomock.Any(), aksConfigSpec.ResourceGroup, aksConfigSpec.ClusterName, gomock.Any()).
+				DoAndReturn(func(_ context.Context, _, _ string, options *armcontainerservice.ManagedClustersClientListClusterUserCredentialsOptions) (armcontainerservice.ManagedClustersClientListClusterUserCredentialsResponse, error) {
+					Expect(options).ToNot(BeNil())
+					Expect(options.Format).To(HaveValue(Equal(armcontainerservice.FormatExec)))
+
+					return userCredentialsResponse("clusterUser", []byte(kubeconfigExecYAML)), nil
+				})
+
+			config, err := handler.getClusterKubeConfig(ctx, aksConfigSpec)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(config).ToNot(BeNil())
+			Expect(config.Host).To(Equal("https://test.com"))
+			Expect(config.BearerToken).To(Equal("test-token"))
+			Expect(config.ExecProvider).To(BeNil())
+			// The server application ID is taken from the exec configuration returned by AKS.
+			Expect(tokenCredential.scopes).To(Equal([]string{"test-server-id/.default"}))
+		})
+
+		It("should return error if the user credentials cannot be retrieved", func() {
+			clusterClientMock.EXPECT().ListClusterUserCredentials(gomock.Any(), aksConfigSpec.ResourceGroup, aksConfigSpec.ClusterName, gomock.Any()).
+				Return(armcontainerservice.ManagedClustersClientListClusterUserCredentialsResponse{}, errors.New("error"))
+
+			_, err := handler.getClusterKubeConfig(ctx, aksConfigSpec)
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("should return error if no user credentials are returned", func() {
+			clusterClientMock.EXPECT().ListClusterUserCredentials(gomock.Any(), aksConfigSpec.ResourceGroup, aksConfigSpec.ClusterName, gomock.Any()).
+				Return(armcontainerservice.ManagedClustersClientListClusterUserCredentialsResponse{}, nil)
+
+			_, err := handler.getClusterKubeConfig(ctx, aksConfigSpec)
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("should return error if the returned kubeconfig is invalid", func() {
+			clusterClientMock.EXPECT().ListClusterUserCredentials(gomock.Any(), aksConfigSpec.ResourceGroup, aksConfigSpec.ClusterName, gomock.Any()).
+				Return(userCredentialsResponse("clusterUser", []byte("invalid")), nil)
+
+			_, err := handler.getClusterKubeConfig(ctx, aksConfigSpec)
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("should return error if the token cannot be requested", func() {
+			tokenCredential.err = errors.New("error")
+			clusterClientMock.EXPECT().ListClusterUserCredentials(gomock.Any(), aksConfigSpec.ResourceGroup, aksConfigSpec.ClusterName, gomock.Any()).
+				Return(userCredentialsResponse("clusterUser", []byte(kubeconfigExecYAML)), nil)
+
+			_, err := handler.getClusterKubeConfig(ctx, aksConfigSpec)
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("should return error if no token credential is configured", func() {
+			handler.azureClients.tokenCredential = nil
+
+			_, err := handler.getClusterKubeConfig(ctx, aksConfigSpec)
+			Expect(err).To(HaveOccurred())
+		})
+	})
 })
+
+var _ = Describe("isLocalAccountsDisabledError", func() {
+	It("should detect the error returned by Azure when local accounts are disabled", func() {
+		Expect(isLocalAccountsDisabledError(localAccountsDisabledError())).To(BeTrue())
+	})
+
+	It("should not detect unrelated errors", func() {
+		Expect(isLocalAccountsDisabledError(nil)).To(BeFalse())
+		Expect(isLocalAccountsDisabledError(errors.New("error"))).To(BeFalse())
+	})
+})
+
+var _ = Describe("clusterUserKubeConfig", func() {
+	It("should return the cluster user kubeconfig", func() {
+		kubeConfigs := []*armcontainerservice.CredentialResult{
+			nil,
+			{Name: to.Ptr("clusterMonitoringUser"), Value: []byte("monitoring")},
+			{Name: to.Ptr("clusterUser"), Value: []byte("user")},
+		}
+
+		Expect(clusterUserKubeConfig(kubeConfigs)).To(Equal([]byte("user")))
+	})
+
+	It("should fall back to the first non empty kubeconfig", func() {
+		kubeConfigs := []*armcontainerservice.CredentialResult{
+			{Name: to.Ptr("clusterUser"), Value: []byte{}},
+			{Value: []byte("user")},
+		}
+
+		Expect(clusterUserKubeConfig(kubeConfigs)).To(Equal([]byte("user")))
+	})
+
+	It("should return nothing if there are no kubeconfigs", func() {
+		Expect(clusterUserKubeConfig(nil)).To(BeEmpty())
+	})
+})
+
+var _ = Describe("serverApplicationID", func() {
+	It("should return the server application ID of the exec configuration", func() {
+		kubeConfig, err := clientcmd.Load([]byte(kubeconfigExecYAML))
+		Expect(err).ToNot(HaveOccurred())
+
+		Expect(serverApplicationID(kubeConfig)).To(Equal("test-server-id"))
+	})
+
+	It("should support the server application ID being passed as a single argument", func() {
+		kubeConfig := &clientcmdapi.Config{
+			AuthInfos: map[string]*clientcmdapi.AuthInfo{
+				"test": {Exec: &clientcmdapi.ExecConfig{Args: []string{"get-token", "--server-id=test-server-id"}}},
+			},
+		}
+
+		Expect(serverApplicationID(kubeConfig)).To(Equal("test-server-id"))
+	})
+
+	It("should fall back to the well known server application ID", func() {
+		kubeConfig, err := clientcmd.Load([]byte(kubeconfigYAML))
+		Expect(err).ToNot(HaveOccurred())
+
+		Expect(serverApplicationID(kubeConfig)).To(Equal(aksAADServerApplicationID))
+	})
+})
+
+// fakeTokenCredential is a token credential returning a static token, recording the requested scopes.
+type fakeTokenCredential struct {
+	token  azcore.AccessToken
+	err    error
+	scopes []string
+}
+
+func (f *fakeTokenCredential) GetToken(_ context.Context, options policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	f.scopes = options.Scopes
+	return f.token, f.err
+}
+
+// localAccountsDisabledError returns the error Azure responds with when static credentials are requested for
+// a cluster that has local accounts disabled.
+func localAccountsDisabledError() error {
+	body := `{"code":"BadRequest","message":"Getting static credential is not allowed because this cluster is set to disable local accounts."}`
+
+	request, err := http.NewRequest(http.MethodPost, "https://management.azure.com/subscriptions/test", nil)
+	Expect(err).ToNot(HaveOccurred())
+
+	return runtime.NewResponseError(&http.Response{
+		Status:     "400 Bad Request",
+		StatusCode: http.StatusBadRequest,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    request,
+	})
+}
+
+func userCredentialsResponse(name string, kubeConfig []byte) armcontainerservice.ManagedClustersClientListClusterUserCredentialsResponse {
+	return armcontainerservice.ManagedClustersClientListClusterUserCredentialsResponse{
+		CredentialResults: armcontainerservice.CredentialResults{
+			Kubeconfigs: []*armcontainerservice.CredentialResult{
+				{Name: to.Ptr(name), Value: kubeConfig},
+			},
+		},
+	}
+}
 
 var _ = Describe("validateConfig", func() {
 	var (

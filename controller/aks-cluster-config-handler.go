@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v5"
 	wranglerv1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
@@ -18,6 +20,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/rancher/aks-operator/pkg/aks"
 	"github.com/rancher/aks-operator/pkg/aks/services"
@@ -37,6 +40,23 @@ const (
 	aksConfigImportingPhase  = "importing"
 	poolNameMaxLength        = 6
 	wait                     = 30
+)
+
+const (
+	// clusterAdminRoleName is the access profile role used to retrieve the static admin credentials of a
+	// cluster. It is not available on clusters created with local accounts disabled.
+	clusterAdminRoleName = "clusterAdmin"
+
+	// clusterUserCredentialName is the name of the credential returned by AKS for the cluster user.
+	clusterUserCredentialName = "clusterUser"
+
+	// aksAADServerApplicationID is the well known application ID of the AKS Microsoft Entra ID (AAD) server.
+	// Access tokens used to authenticate against an Entra ID enabled cluster have to be issued for it.
+	// See https://learn.microsoft.com/azure/aks/kubelogin-authentication for more details.
+	aksAADServerApplicationID = "6dae42f8-4368-4678-94ff-3960e28e3630"
+
+	// serverIDArg is the kubelogin argument holding the Entra ID server application the token is issued for.
+	serverIDArg = "--server-id"
 )
 
 // Cluster Status
@@ -93,6 +113,10 @@ type Handler struct {
 
 type azureClients struct {
 	credentials aks.Credentials
+
+	// tokenCredential is used to request Microsoft Entra ID (AAD) access tokens for clusters that have
+	// local accounts disabled and therefore cannot return static credentials.
+	tokenCredential azcore.TokenCredential
 
 	clustersClient       services.ManagedClustersClientInterface
 	resourceGroupsClient services.ResourceGroupsClientInterface
@@ -573,9 +597,16 @@ func (h *Handler) createCASecret(ctx context.Context, config *aksv1.AKSClusterCo
 }
 
 func (h *Handler) getClusterKubeConfig(ctx context.Context, spec *aksv1.AKSClusterConfigSpec) (restConfig *rest.Config, err error) {
-	accessProfile, err := h.azureClients.clustersClient.GetAccessProfile(ctx, spec.ResourceGroup, spec.ClusterName, "clusterAdmin", nil)
+	accessProfile, err := h.azureClients.clustersClient.GetAccessProfile(ctx, spec.ResourceGroup, spec.ClusterName, clusterAdminRoleName, nil)
 	if err != nil {
-		return nil, err
+		// Clusters configured with local accounts disabled do not expose static admin credentials. For
+		// those clusters the kubeconfig has to be built from the Microsoft Entra ID (AAD) user credential.
+		if !isLocalAccountsDisabledError(err) {
+			return nil, err
+		}
+
+		logrus.Infof("Cluster [%s] has local accounts disabled, authenticating with Microsoft Entra ID", spec.ClusterName)
+		return h.getEntraIDClusterKubeConfig(ctx, spec)
 	}
 
 	config, err := clientcmd.RESTConfigFromKubeConfig(accessProfile.Properties.KubeConfig)
@@ -583,6 +614,111 @@ func (h *Handler) getClusterKubeConfig(ctx context.Context, spec *aksv1.AKSClust
 		return nil, err
 	}
 	return config, nil
+}
+
+// getEntraIDClusterKubeConfig builds a kubeconfig for clusters that have local accounts disabled. AKS only
+// returns a Microsoft Entra ID (AAD) user credential for those clusters, which relies on the kubelogin exec
+// plugin that is not available to the operator. The exec configuration is therefore replaced by an access
+// token requested for the AKS Entra ID server application with the configured Azure credentials.
+//
+// The service principal of the cloud credential needs administrative access to the cluster, either by being
+// a member of one of the Entra ID admin groups of the cluster or through an Azure RBAC role assignment.
+func (h *Handler) getEntraIDClusterKubeConfig(ctx context.Context, spec *aksv1.AKSClusterConfigSpec) (*rest.Config, error) {
+	if h.azureClients.tokenCredential == nil {
+		return nil, fmt.Errorf("cannot authenticate to cluster [%s] with Microsoft Entra ID: no token credential configured", spec.ClusterName)
+	}
+
+	credentials, err := h.azureClients.clustersClient.ListClusterUserCredentials(ctx, spec.ResourceGroup, spec.ClusterName,
+		&armcontainerservice.ManagedClustersClientListClusterUserCredentialsOptions{
+			Format: to.Ptr(armcontainerservice.FormatExec),
+		})
+	if err != nil {
+		return nil, fmt.Errorf("error getting user credentials for cluster [%s]: %w", spec.ClusterName, err)
+	}
+
+	kubeConfigData := clusterUserKubeConfig(credentials.Kubeconfigs)
+	if len(kubeConfigData) == 0 {
+		return nil, fmt.Errorf("no user credentials returned for cluster [%s]", spec.ClusterName)
+	}
+
+	kubeConfig, err := clientcmd.Load(kubeConfigData)
+	if err != nil {
+		return nil, err
+	}
+
+	token, err := h.azureClients.tokenCredential.GetToken(ctx, policy.TokenRequestOptions{
+		Scopes: []string{serverApplicationID(kubeConfig) + "/.default"},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error getting Microsoft Entra ID token for cluster [%s]: %w", spec.ClusterName, err)
+	}
+
+	for _, authInfo := range kubeConfig.AuthInfos {
+		authInfo.Exec = nil
+		authInfo.AuthProvider = nil
+		authInfo.Token = token.Token
+	}
+
+	kubeConfigData, err = clientcmd.Write(*kubeConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	return clientcmd.RESTConfigFromKubeConfig(kubeConfigData)
+}
+
+// isLocalAccountsDisabledError returns true if Azure refused to return static credentials because the
+// cluster is configured with local accounts disabled.
+func isLocalAccountsDisabledError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// The error returned by Azure is a bad request with the message "Getting static credential is not
+	// allowed because this cluster is set to disable local accounts.". The response body is part of the
+	// error message of the SDK response error.
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "disable local accounts") || strings.Contains(message, "local accounts are disabled")
+}
+
+// clusterUserKubeConfig returns the kubeconfig of the cluster user from the given credentials.
+func clusterUserKubeConfig(kubeConfigs []*armcontainerservice.CredentialResult) []byte {
+	var firstKubeConfig []byte
+
+	for _, kubeConfig := range kubeConfigs {
+		if kubeConfig == nil || len(kubeConfig.Value) == 0 {
+			continue
+		}
+		if kubeConfig.Name != nil && *kubeConfig.Name == clusterUserCredentialName {
+			return kubeConfig.Value
+		}
+		if firstKubeConfig == nil {
+			firstKubeConfig = kubeConfig.Value
+		}
+	}
+
+	return firstKubeConfig
+}
+
+// serverApplicationID returns the Entra ID server application the access token has to be issued for. It is
+// part of the exec configuration returned by AKS, which makes sure the correct value is used in sovereign
+// clouds. The well known application ID of the public cloud is used when it cannot be determined.
+func serverApplicationID(kubeConfig *clientcmdapi.Config) string {
+	for _, authInfo := range kubeConfig.AuthInfos {
+		if authInfo == nil || authInfo.Exec == nil {
+			continue
+		}
+		for i, arg := range authInfo.Exec.Args {
+			if arg == serverIDArg && i+1 < len(authInfo.Exec.Args) {
+				return authInfo.Exec.Args[i+1]
+			}
+			if serverID, found := strings.CutPrefix(arg, serverIDArg+"="); found && serverID != "" {
+				return serverID
+			}
+		}
+	}
+
+	return aksAADServerApplicationID
 }
 
 func (h *Handler) buildUpstreamClusterState(ctx context.Context, credentials *aks.Credentials, spec *aksv1.AKSClusterConfigSpec) (*aksv1.AKSClusterConfigSpec, error) {
@@ -1061,6 +1197,7 @@ func (h *Handler) getAzureClients(config *aksv1.AKSClusterConfig) error {
 
 	h.azureClients = azureClients{
 		credentials:          *credentials,
+		tokenCredential:      clientSecretCredential,
 		clustersClient:       clustersClient,
 		resourceGroupsClient: rgClient,
 		agentPoolsClient:     agentPoolsClient,
