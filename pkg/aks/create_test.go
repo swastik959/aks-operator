@@ -156,6 +156,19 @@ var _ = Describe("newManagedCluster", func() {
 		Expect(managedCluster.Properties.APIServerAccessProfile.PrivateDNSZone).To(Equal(clusterSpec.PrivateDNSZone))
 	})
 
+	It("should always enable RBAC", func() {
+		workplacesClientMock.EXPECT().Get(ctx, String(clusterSpec.LogAnalyticsWorkspaceGroup), String(clusterSpec.LogAnalyticsWorkspaceName), nil).
+			Return(armoperationalinsights.WorkspacesClientGetResponse{
+				Workspace: armoperationalinsights.Workspace{
+					ID: to.Ptr("test-workspace-id"),
+				},
+			}, nil)
+
+		managedCluster, err := createManagedCluster(ctx, cred, workplacesClientMock, clusterSpec, "test-phase")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(managedCluster.Properties.EnableRBAC).To(Equal(to.Ptr(true)))
+	})
+
 	It("should successfully create managed cluster with custom load balancer sku", func() {
 		workplacesClientMock.EXPECT().Get(ctx, String(clusterSpec.LogAnalyticsWorkspaceGroup), String(clusterSpec.LogAnalyticsWorkspaceName), nil).
 			Return(armoperationalinsights.WorkspacesClientGetResponse{

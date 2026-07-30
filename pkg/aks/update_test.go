@@ -117,6 +117,16 @@ var _ = Describe("updateCluster", func() {
 		Expect(updatedCluster.Properties.KubernetesVersion).To(BeNil())
 	})
 
+	It("should keep the upstream RBAC setting", func() {
+		actualCluster.Properties.EnableRBAC = to.Ptr(false)
+		desiredCluster, err := createManagedCluster(ctx, cred, workplacesClientMock, clusterSpec, "phase")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(desiredCluster.Properties.EnableRBAC).To(Equal(to.Ptr(true)))
+
+		updatedCluster := updateCluster(*desiredCluster, *actualCluster, false)
+		Expect(updatedCluster.Properties.EnableRBAC).To(Equal(to.Ptr(false)))
+	})
+
 	It("shouldn't add new agent pool profile if it already exists", func() {
 		actualCluster.Properties.AgentPoolProfiles = []*armcontainerservice.ManagedClusterAgentPoolProfile{
 			{

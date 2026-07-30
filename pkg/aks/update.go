@@ -79,6 +79,9 @@ func updateCluster(desiredCluster armcontainerservice.ManagedCluster, actualClus
 		actualCluster.Properties.KubernetesVersion = desiredCluster.Properties.KubernetesVersion
 	}
 
+	// EnableRBAC is deliberately not copied from the desired cluster. It cannot be changed after creation,
+	// so whatever AKS reports is kept to avoid rejected updates on clusters that were created without RBAC.
+
 	// Add/update agent pool profiles
 	if actualCluster.Properties.AgentPoolProfiles == nil {
 		actualCluster.Properties.AgentPoolProfiles = []*armcontainerservice.ManagedClusterAgentPoolProfile{}

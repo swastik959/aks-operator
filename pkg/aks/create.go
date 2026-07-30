@@ -58,6 +58,10 @@ func createManagedCluster(ctx context.Context, cred *Credentials, workplacesClie
 		Location: to.Ptr(spec.ResourceLocation),
 		Properties: &armcontainerservice.ManagedClusterProperties{
 			KubernetesVersion: spec.KubernetesVersion,
+			// Kubernetes RBAC is required by Rancher and can no longer be disabled in AKS. It is set
+			// explicitly so the request always carries properties.enableRBAC: when the field is absent,
+			// Azure Policy evaluates it as not enabled and denies the deployment.
+			EnableRBAC: to.Ptr(true),
 		},
 	}
 
