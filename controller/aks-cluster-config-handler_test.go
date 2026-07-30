@@ -2,9 +2,13 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"strings"
+	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v5"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
@@ -46,6 +50,44 @@ users:
     client-certificate-data: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCnRlc3QKLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=
     client-key-data: LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVktLS0tLQp0ZXN0Ci0tLS0tRU5EIFJTQSBQUklWQVRFIEtFWS0tLS0tCg==
     token: dGVzdA==`
+
+// userKubeconfigYAML is the shape of the cluster user kubeconfig AKS returns for a cluster with Microsoft
+// Entra ID integration: it authenticates through the kubelogin credential plugin.
+const userKubeconfigYAML = `
+apiVersion: v1
+clusters:
+- cluster:
+    certificate-authority-data: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCnRlc3QKLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=
+    server: https://test.com
+  name: test
+contexts:
+- context:
+    cluster: test
+    user: test
+  name: test
+current-context: test
+kind: Config
+preferences: {}
+users:
+- name: test
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1beta1
+      command: kubelogin
+      args:
+      - get-token
+      - --server-id
+      - test-server-app-id`
+
+// fakeTokenCredential hands out a static token, the operator credential can't be used in tests because it
+// would authenticate against Microsoft Entra ID.
+type fakeTokenCredential struct {
+	token string
+}
+
+func (f *fakeTokenCredential) GetToken(_ context.Context, _ policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	return azcore.AccessToken{Token: f.token, ExpiresOn: time.Now().Add(time.Hour)}, nil
+}
 
 var _ = Describe("importCluster", func() {
 	var (
@@ -168,7 +210,8 @@ var _ = Describe("getClusterKubeConfig", func() {
 		}
 		handler = &Handler{
 			azureClients: azureClients{
-				clustersClient: clusterClientMock,
+				clustersClient:  clusterClientMock,
+				tokenCredential: &fakeTokenCredential{token: "test-token"},
 			},
 		}
 	})
@@ -210,6 +253,75 @@ var _ = Describe("getClusterKubeConfig", func() {
 
 		_, err := handler.getClusterKubeConfig(ctx, aksConfigSpec)
 		Expect(err).To(HaveOccurred())
+	})
+
+	It("should use the cluster user kubeconfig if local accounts are disabled", func() {
+		aksConfigSpec.DisableLocalAccounts = to.Ptr(true)
+		clusterClientMock.EXPECT().ListClusterUserCredentials(gomock.Any(), aksConfigSpec.ResourceGroup, aksConfigSpec.ClusterName, nil).
+			Return(armcontainerservice.ManagedClustersClientListClusterUserCredentialsResponse{
+				CredentialResults: armcontainerservice.CredentialResults{
+					Kubeconfigs: []*armcontainerservice.CredentialResult{
+						{Name: to.Ptr("clusterUser"), Value: []byte(userKubeconfigYAML)},
+					},
+				},
+			}, nil)
+
+		config, err := handler.getClusterKubeConfig(ctx, aksConfigSpec)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(config).ToNot(BeNil())
+		Expect(config.BearerToken).To(Equal("test-token"))
+	})
+
+	It("should fall back to the cluster user kubeconfig if azure refuses the admin credentials", func() {
+		clusterClientMock.EXPECT().GetAccessProfile(gomock.Any(), aksConfigSpec.ResourceGroup, aksConfigSpec.ClusterName, "clusterAdmin", nil).
+			Return(armcontainerservice.ManagedClustersClientGetAccessProfileResponse{},
+				errors.New("Getting static credential is not allowed because this cluster is set to disable local accounts"))
+		clusterClientMock.EXPECT().ListClusterUserCredentials(gomock.Any(), aksConfigSpec.ResourceGroup, aksConfigSpec.ClusterName, nil).
+			Return(armcontainerservice.ManagedClustersClientListClusterUserCredentialsResponse{
+				CredentialResults: armcontainerservice.CredentialResults{
+					Kubeconfigs: []*armcontainerservice.CredentialResult{
+						{Name: to.Ptr("clusterUser"), Value: []byte(userKubeconfigYAML)},
+					},
+				},
+			}, nil)
+
+		config, err := handler.getClusterKubeConfig(ctx, aksConfigSpec)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(config).ToNot(BeNil())
+	})
+
+	It("should return error if no credential is available to authenticate", func() {
+		aksConfigSpec.DisableLocalAccounts = to.Ptr(true)
+		handler.azureClients.tokenCredential = nil
+		clusterClientMock.EXPECT().ListClusterUserCredentials(gomock.Any(), aksConfigSpec.ResourceGroup, aksConfigSpec.ClusterName, nil).
+			Return(armcontainerservice.ManagedClustersClientListClusterUserCredentialsResponse{
+				CredentialResults: armcontainerservice.CredentialResults{
+					Kubeconfigs: []*armcontainerservice.CredentialResult{
+						{Name: to.Ptr("clusterUser"), Value: []byte(userKubeconfigYAML)},
+					},
+				},
+			}, nil)
+
+		_, err := handler.getClusterKubeConfig(ctx, aksConfigSpec)
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("shouldn't request a token when only the cluster connection details are needed", func() {
+		aksConfigSpec.DisableLocalAccounts = to.Ptr(true)
+		handler.azureClients.tokenCredential = nil
+		clusterClientMock.EXPECT().ListClusterUserCredentials(gomock.Any(), aksConfigSpec.ResourceGroup, aksConfigSpec.ClusterName, nil).
+			Return(armcontainerservice.ManagedClustersClientListClusterUserCredentialsResponse{
+				CredentialResults: armcontainerservice.CredentialResults{
+					Kubeconfigs: []*armcontainerservice.CredentialResult{
+						{Name: to.Ptr("clusterUser"), Value: []byte(userKubeconfigYAML)},
+					},
+				},
+			}, nil)
+
+		config, err := handler.clusterRESTConfig(ctx, aksConfigSpec, false)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(config.Host).To(Equal("https://test.com"))
+		Expect(config.BearerToken).To(BeEmpty())
 	})
 })
 
@@ -870,6 +982,13 @@ var _ = Describe("buildUpstreamClusterState", func() {
 					AuthorizedIPRanges:   utils.ConvertToSliceOfPointers(to.Ptr([]string{"test"})),
 					PrivateDNSZone:       to.Ptr("test-private-dns-zone-id"),
 				},
+				AADProfile: &armcontainerservice.ManagedClusterAADProfile{
+					Managed:             to.Ptr(true),
+					EnableAzureRBAC:     to.Ptr(true),
+					AdminGroupObjectIDs: utils.ConvertToSliceOfPointers(to.Ptr([]string{"test"})),
+					TenantID:            to.Ptr("test"),
+				},
+				DisableLocalAccounts: to.Ptr(true),
 			},
 			Tags: aks.StringMapPtr(map[string]string{"test": "test"}),
 		}
@@ -927,6 +1046,26 @@ var _ = Describe("buildUpstreamClusterState", func() {
 		Expect(upstreamSpec.PrivateCluster).To(Equal(to.Ptr(*clusterState.Properties.APIServerAccessProfile.EnablePrivateCluster)))
 		Expect(upstreamSpec.PrivateDNSZone).To(Equal(to.Ptr(*clusterState.Properties.APIServerAccessProfile.PrivateDNSZone)))
 		Expect(upstreamSpec.AuthorizedIPRanges).To(Equal(utils.ConvertToPointerOfSlice(clusterState.Properties.APIServerAccessProfile.AuthorizedIPRanges)))
+		Expect(upstreamSpec.AADProfile).ToNot(BeNil())
+		Expect(upstreamSpec.AADProfile.Managed).To(Equal(clusterState.Properties.AADProfile.Managed))
+		Expect(upstreamSpec.AADProfile.EnableAzureRBAC).To(Equal(clusterState.Properties.AADProfile.EnableAzureRBAC))
+		Expect(upstreamSpec.AADProfile.TenantID).To(Equal(clusterState.Properties.AADProfile.TenantID))
+		Expect(upstreamSpec.AADProfile.AdminGroupObjectIDs).To(Equal(utils.ConvertToPointerOfSlice(clusterState.Properties.AADProfile.AdminGroupObjectIDs)))
+		Expect(upstreamSpec.DisableLocalAccounts).To(Equal(clusterState.Properties.DisableLocalAccounts))
+	})
+
+	It("should build upstream cluster state without Microsoft Entra ID integration", func() {
+		clusterState.Properties.AADProfile = nil
+		clusterState.Properties.DisableLocalAccounts = nil
+		clusterClientMock.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), nil).Return(
+			armcontainerservice.ManagedClustersClientGetResponse{
+				ManagedCluster: *clusterState,
+			}, nil)
+
+		upstreamSpec, err := handler.buildUpstreamClusterState(ctx, credentials, &aksConfig.Spec)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(upstreamSpec.AADProfile).To(BeNil())
+		Expect(upstreamSpec.DisableLocalAccounts).To(Equal(to.Ptr(false)))
 	})
 
 	It("should fail if azure client fails to get cluster", func() {

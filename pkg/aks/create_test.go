@@ -169,6 +169,48 @@ var _ = Describe("newManagedCluster", func() {
 		Expect(managedCluster.Properties.EnableRBAC).To(Equal(to.Ptr(true)))
 	})
 
+	It("should successfully create managed cluster with Microsoft Entra ID integration", func() {
+		workplacesClientMock.EXPECT().Get(ctx, String(clusterSpec.LogAnalyticsWorkspaceGroup), String(clusterSpec.LogAnalyticsWorkspaceName), nil).
+			Return(armoperationalinsights.WorkspacesClientGetResponse{
+				Workspace: armoperationalinsights.Workspace{
+					ID: to.Ptr("test-workspace-id"),
+				},
+			}, nil)
+
+		clusterSpec.AADProfile = &aksv1.AKSAADProfile{
+			Managed:             to.Ptr(true),
+			EnableAzureRBAC:     to.Ptr(true),
+			AdminGroupObjectIDs: to.Ptr([]string{"test-admin-group-object-id"}),
+			TenantID:            to.Ptr("test-tenant-id"),
+		}
+		clusterSpec.DisableLocalAccounts = to.Ptr(true)
+
+		managedCluster, err := createManagedCluster(ctx, cred, workplacesClientMock, clusterSpec, "test-phase")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(managedCluster.Properties.AADProfile).ToNot(BeNil())
+		Expect(managedCluster.Properties.AADProfile.Managed).To(Equal(clusterSpec.AADProfile.Managed))
+		Expect(managedCluster.Properties.AADProfile.EnableAzureRBAC).To(Equal(clusterSpec.AADProfile.EnableAzureRBAC))
+		Expect(managedCluster.Properties.AADProfile.TenantID).To(Equal(clusterSpec.AADProfile.TenantID))
+		adminGroupObjectIDs := managedCluster.Properties.AADProfile.AdminGroupObjectIDs
+		Expect(adminGroupObjectIDs).To(HaveLen(1))
+		Expect(*adminGroupObjectIDs[0]).To(Equal("test-admin-group-object-id"))
+		Expect(managedCluster.Properties.DisableLocalAccounts).To(Equal(to.Ptr(true)))
+	})
+
+	It("shouldn't set Microsoft Entra ID integration if it's not specified", func() {
+		workplacesClientMock.EXPECT().Get(ctx, String(clusterSpec.LogAnalyticsWorkspaceGroup), String(clusterSpec.LogAnalyticsWorkspaceName), nil).
+			Return(armoperationalinsights.WorkspacesClientGetResponse{
+				Workspace: armoperationalinsights.Workspace{
+					ID: to.Ptr("test-workspace-id"),
+				},
+			}, nil)
+
+		managedCluster, err := createManagedCluster(ctx, cred, workplacesClientMock, clusterSpec, "test-phase")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(managedCluster.Properties.AADProfile).To(BeNil())
+		Expect(managedCluster.Properties.DisableLocalAccounts).To(BeNil())
+	})
+
 	It("should successfully create managed cluster with custom load balancer sku", func() {
 		workplacesClientMock.EXPECT().Get(ctx, String(clusterSpec.LogAnalyticsWorkspaceGroup), String(clusterSpec.LogAnalyticsWorkspaceName), nil).
 			Return(armoperationalinsights.WorkspacesClientGetResponse{

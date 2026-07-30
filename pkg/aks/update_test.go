@@ -127,6 +127,36 @@ var _ = Describe("updateCluster", func() {
 		Expect(updatedCluster.Properties.EnableRBAC).To(Equal(to.Ptr(false)))
 	})
 
+	It("should update the Microsoft Entra ID integration", func() {
+		clusterSpec.AADProfile = &aksv1.AKSAADProfile{
+			Managed:             to.Ptr(true),
+			EnableAzureRBAC:     to.Ptr(true),
+			AdminGroupObjectIDs: to.Ptr([]string{"test-admin-group-object-id"}),
+		}
+		clusterSpec.DisableLocalAccounts = to.Ptr(true)
+
+		desiredCluster, err := createManagedCluster(ctx, cred, workplacesClientMock, clusterSpec, "phase")
+		Expect(err).ToNot(HaveOccurred())
+
+		updatedCluster := updateCluster(*desiredCluster, *actualCluster, false)
+		Expect(updatedCluster.Properties.AADProfile).To(Equal(desiredCluster.Properties.AADProfile))
+		Expect(updatedCluster.Properties.DisableLocalAccounts).To(Equal(to.Ptr(true)))
+	})
+
+	It("should keep the upstream Microsoft Entra ID integration if it's not specified", func() {
+		actualCluster.Properties.AADProfile = &armcontainerservice.ManagedClusterAADProfile{
+			Managed: to.Ptr(true),
+		}
+		actualCluster.Properties.DisableLocalAccounts = to.Ptr(true)
+
+		desiredCluster, err := createManagedCluster(ctx, cred, workplacesClientMock, clusterSpec, "phase")
+		Expect(err).ToNot(HaveOccurred())
+
+		updatedCluster := updateCluster(*desiredCluster, *actualCluster, false)
+		Expect(updatedCluster.Properties.AADProfile).To(Equal(actualCluster.Properties.AADProfile))
+		Expect(updatedCluster.Properties.DisableLocalAccounts).To(Equal(to.Ptr(true)))
+	})
+
 	It("shouldn't add new agent pool profile if it already exists", func() {
 		actualCluster.Properties.AgentPoolProfiles = []*armcontainerservice.ManagedClusterAgentPoolProfile{
 			{

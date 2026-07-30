@@ -93,7 +93,8 @@ type Handler struct {
 }
 
 type azureClients struct {
-	credentials aks.Credentials
+	credentials     aks.Credentials
+	tokenCredential azcore.TokenCredential
 
 	clustersClient       services.ManagedClustersClientInterface
 	resourceGroupsClient services.ResourceGroupsClientInterface
@@ -603,8 +604,8 @@ func (h *Handler) clusterRESTConfig(ctx context.Context, spec *aksv1.AKSClusterC
 
 	var credential azcore.TokenCredential
 	if authenticate {
-		if credential, err = aks.NewClientSecretCredential(&h.azureClients.credentials); err != nil {
-			return nil, fmt.Errorf("error creating client secret credential: %w", err)
+		if credential = h.azureClients.tokenCredential; credential == nil {
+			return nil, fmt.Errorf("no Azure credential available to authenticate to cluster [%s]", spec.ClusterName)
 		}
 	}
 
@@ -1109,6 +1110,7 @@ func (h *Handler) getAzureClients(config *aksv1.AKSClusterConfig) error {
 
 	h.azureClients = azureClients{
 		credentials:          *credentials,
+		tokenCredential:      clientSecretCredential,
 		clustersClient:       clustersClient,
 		resourceGroupsClient: rgClient,
 		agentPoolsClient:     agentPoolsClient,
