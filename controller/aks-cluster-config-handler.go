@@ -399,6 +399,10 @@ func (h *Handler) validateConfig(config *aksv1.AKSClusterConfig) error {
 	if config.Spec.DNSPrefix == nil {
 		return fmt.Errorf(cannotBeNilError, "dnsPrefix", config.Spec.ClusterName, config.Name)
 	}
+	if aks.Bool(config.Spec.DisableLocalAccounts) &&
+		(config.Spec.AADProfile == nil || !aks.Bool(config.Spec.AADProfile.Managed)) {
+		return fmt.Errorf("field [aadProfile.managed] must be enabled to disable local accounts for cluster [%s (id: %s)]", config.Spec.ClusterName, config.Name)
+	}
 
 	nodeP := map[string]bool{}
 	systemMode := false

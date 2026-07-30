@@ -23,6 +23,41 @@ You can use the following command to deploy a Kind cluster with Rancher manager 
 
 After this, you can also downscale operator deployment and run operator from a local binary.
 
+## Microsoft Entra ID integration and local accounts
+
+Clusters are always created with Kubernetes RBAC enabled (`properties.enableRBAC: true`), which is required by
+Rancher and by the built-in Azure Policy _"Role-Based Access Control (RBAC) should be used on Kubernetes Services"_.
+
+Microsoft Entra ID (formerly Azure Active Directory) integration can be configured on the `AKSClusterConfig` spec, and
+static (local) accounts can be disabled to satisfy the built-in Azure Policy _"Azure Kubernetes Service Clusters should
+have local authentication methods disabled"_:
+
+```yaml
+spec:
+  aadProfile:
+    managed: true
+    enableAzureRbac: true
+    adminGroupObjectIds:
+      - 00000000-0000-0000-0000-000000000000
+    tenantId: 00000000-0000-0000-0000-000000000000
+  disableLocalAccounts: true
+```
+
+`disableLocalAccounts` requires `aadProfile.managed` to be enabled, because the cluster admin certificate that the
+operator uses by default is no longer issued by AKS. When local accounts are disabled, the operator retrieves the
+cluster user kubeconfig instead and authenticates against the cluster with a Microsoft Entra ID token obtained from the
+credentials of the cloud credential in use.
+
+This imposes additional requirements on the service principal (or managed identity) of the Azure cloud credential, on
+top of the `Contributor` role needed to manage the cluster:
+
+* **Azure Kubernetes Service Cluster User Role** on the cluster (or its resource group), so that the cluster user
+  kubeconfig can be listed.
+* When `enableAzureRbac` is set, an Azure RBAC role granting cluster administrator access, for example **Azure
+  Kubernetes Service RBAC Cluster Admin**, so that the operator can create resources in the cluster. When Azure RBAC is
+  not used, add the service principal object ID to `adminGroupObjectIds`, or make it a member of one of those groups
+  instead.
+
 ## Tests
 
 Running unit tests can be done using the following command:

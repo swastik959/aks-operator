@@ -599,6 +599,22 @@ var _ = Describe("validateConfig", func() {
 		aksConfig.Spec.NetworkPlugin = to.Ptr(string(armcontainerservice.NetworkPluginKubenet))
 		Expect(handler.validateConfig(aksConfig)).NotTo(Succeed())
 	})
+
+	It("should fail if local accounts are disabled without managed Microsoft Entra ID integration", func() {
+		aksConfig.Spec.DisableLocalAccounts = to.Ptr(true)
+		Expect(handler.validateConfig(aksConfig)).NotTo(Succeed())
+
+		aksConfig.Spec.AADProfile = &aksv1.AKSAADProfile{}
+		Expect(handler.validateConfig(aksConfig)).NotTo(Succeed())
+	})
+
+	It("should succeed if local accounts are disabled with managed Microsoft Entra ID integration", func() {
+		aksConfig.Spec.DisableLocalAccounts = to.Ptr(true)
+		aksConfig.Spec.AADProfile = &aksv1.AKSAADProfile{
+			Managed: to.Ptr(true),
+		}
+		Expect(handler.validateConfig(aksConfig)).To(Succeed())
+	})
 })
 
 var _ = Describe("createCluster", func() {
