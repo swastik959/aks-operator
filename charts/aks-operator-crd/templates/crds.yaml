@@ -21,6 +21,25 @@ spec:
         properties:
           spec:
             properties:
+              aadProfile:
+                nullable: true
+                properties:
+                  adminGroupObjectIds:
+                    items:
+                      nullable: true
+                      type: string
+                    nullable: true
+                    type: array
+                  enableAzureRbac:
+                    nullable: true
+                    type: boolean
+                  managed:
+                    nullable: true
+                    type: boolean
+                  tenantId:
+                    nullable: true
+                    type: string
+                type: object
               authBaseUrl:
                 nullable: true
                 type: string
@@ -39,6 +58,9 @@ spec:
               clusterName:
                 nullable: true
                 type: string
+              disableLocalAccounts:
+                nullable: true
+                type: boolean
               dnsPrefix:
                 nullable: true
                 type: string

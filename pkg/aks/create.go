@@ -287,6 +287,19 @@ func createManagedCluster(ctx context.Context, cred *Credentials, workplacesClie
 		}
 	}
 
+	if spec.AADProfile != nil {
+		managedCluster.Properties.AADProfile = &armcontainerservice.ManagedClusterAADProfile{
+			Managed:             spec.AADProfile.Managed,
+			EnableAzureRBAC:     spec.AADProfile.EnableAzureRBAC,
+			AdminGroupObjectIDs: utils.ConvertToSliceOfPointers(spec.AADProfile.AdminGroupObjectIDs),
+			TenantID:            spec.AADProfile.TenantID,
+		}
+	}
+
+	if spec.DisableLocalAccounts != nil {
+		managedCluster.Properties.DisableLocalAccounts = spec.DisableLocalAccounts
+	}
+
 	if cred.TenantID != "" {
 		managedCluster.Identity = &armcontainerservice.ManagedClusterIdentity{
 			Type: to.Ptr(armcontainerservice.ResourceIdentityTypeSystemAssigned),

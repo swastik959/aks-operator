@@ -146,6 +146,31 @@ type AKSClusterConfigSpec struct {
 	ManagedIdentity *bool `json:"managedIdentity" norman:"pointer"`
 	// UserAssignedIdentity - User assigned identity to be used for the cluster.
 	UserAssignedIdentity *string `json:"userAssignedIdentity" norman:"pointer"`
+	// AADProfile - Microsoft Entra ID (formerly Azure Active Directory) integration of the cluster.
+	// +optional
+	AADProfile *AKSAADProfile `json:"aadProfile,omitempty"`
+	// DisableLocalAccounts - Whether static (local) accounts should be disabled on the cluster. Requires
+	// Microsoft Entra ID integration, see AADProfile.
+	// +optional
+	DisableLocalAccounts *bool `json:"disableLocalAccounts,omitempty"`
+}
+
+// AKSAADProfile describes the Microsoft Entra ID (formerly Azure Active Directory) integration of an AKS cluster.
+type AKSAADProfile struct {
+	// Managed - Whether to enable managed Microsoft Entra ID integration.
+	// +optional
+	Managed *bool `json:"managed,omitempty"`
+	// EnableAzureRBAC - Whether to use Azure RBAC for Kubernetes authorization.
+	// +optional
+	EnableAzureRBAC *bool `json:"enableAzureRbac,omitempty"`
+	// AdminGroupObjectIDs - The list of Microsoft Entra ID group object IDs that will have the admin role
+	// of the cluster.
+	// +optional
+	AdminGroupObjectIDs *[]string `json:"adminGroupObjectIds,omitempty" norman:"pointer"`
+	// TenantID - The Microsoft Entra ID tenant to use for authentication. Defaults to the tenant of the
+	// deployment subscription.
+	// +optional
+	TenantID *string `json:"tenantId,omitempty" norman:"pointer"`
 }
 
 type AKSClusterConfigStatus struct {

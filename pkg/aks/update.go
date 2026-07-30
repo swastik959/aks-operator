@@ -175,6 +175,16 @@ func updateCluster(desiredCluster armcontainerservice.ManagedCluster, actualClus
 		actualCluster.Properties.ServicePrincipalProfile = desiredCluster.Properties.ServicePrincipalProfile
 	}
 
+	// Microsoft Entra ID profile
+	if desiredCluster.Properties.AADProfile != nil {
+		actualCluster.Properties.AADProfile = desiredCluster.Properties.AADProfile
+	}
+
+	// Local accounts
+	if desiredCluster.Properties.DisableLocalAccounts != nil {
+		actualCluster.Properties.DisableLocalAccounts = desiredCluster.Properties.DisableLocalAccounts
+	}
+
 	// Tags
 	if desiredCluster.Tags != nil {
 		actualCluster.Tags = desiredCluster.Tags

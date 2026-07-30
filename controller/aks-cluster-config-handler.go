@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v5"
 	wranglerv1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
@@ -543,7 +544,8 @@ func (h *Handler) enqueueUpdate(config *aksv1.AKSClusterConfig) (*aksv1.AKSClust
 // createCASecret creates a secret containing ca and endpoint. These can be used to create a kubeconfig via
 // the go sdk
 func (h *Handler) createCASecret(ctx context.Context, config *aksv1.AKSClusterConfig) error {
-	kubeConfig, err := h.getClusterKubeConfig(ctx, &config.Spec)
+	// Only the connection details of the cluster are stored, so there is no need to authenticate.
+	kubeConfig, err := h.clusterRESTConfig(ctx, &config.Spec, false)
 	if err != nil {
 		return err
 	}
@@ -573,16 +575,46 @@ func (h *Handler) createCASecret(ctx context.Context, config *aksv1.AKSClusterCo
 }
 
 func (h *Handler) getClusterKubeConfig(ctx context.Context, spec *aksv1.AKSClusterConfigSpec) (restConfig *rest.Config, err error) {
-	accessProfile, err := h.azureClients.clustersClient.GetAccessProfile(ctx, spec.ResourceGroup, spec.ClusterName, "clusterAdmin", nil)
+	return h.clusterRESTConfig(ctx, spec, true)
+}
+
+// clusterRESTConfig returns a rest config for the given cluster. Clusters with local accounts disabled don't
+// expose an admin kubeconfig, for those the cluster user kubeconfig is used and the operator authenticates
+// with a Microsoft Entra ID token of its own service principal. Requesting that token is skipped when
+// authenticate is false, which callers that only need the connection details of the cluster can do.
+func (h *Handler) clusterRESTConfig(ctx context.Context, spec *aksv1.AKSClusterConfigSpec, authenticate bool) (*rest.Config, error) {
+	if !aks.Bool(spec.DisableLocalAccounts) {
+		accessProfile, err := h.azureClients.clustersClient.GetAccessProfile(ctx, spec.ResourceGroup, spec.ClusterName, "clusterAdmin", nil)
+		if err == nil {
+			return clientcmd.RESTConfigFromKubeConfig(accessProfile.Properties.KubeConfig)
+		}
+		// Imported clusters don't have disableLocalAccounts set on their spec, for those Azure rejecting the
+		// request is the first indication that the admin kubeconfig is not available.
+		if !isLocalAccountsDisabledError(err) {
+			return nil, err
+		}
+		logrus.Infof("Local accounts are disabled for cluster [%s], using the cluster user kubeconfig", spec.ClusterName)
+	}
+
+	kubeConfig, err := aks.GetClusterUserKubeConfig(ctx, h.azureClients.clustersClient, spec.ResourceGroup, spec.ClusterName)
 	if err != nil {
 		return nil, err
 	}
 
-	config, err := clientcmd.RESTConfigFromKubeConfig(accessProfile.Properties.KubeConfig)
-	if err != nil {
-		return nil, err
+	var credential azcore.TokenCredential
+	if authenticate {
+		if credential, err = aks.NewClientSecretCredential(&h.azureClients.credentials); err != nil {
+			return nil, fmt.Errorf("error creating client secret credential: %w", err)
+		}
 	}
-	return config, nil
+
+	return aks.RESTConfigFromClusterUserKubeConfig(ctx, kubeConfig, credential)
+}
+
+// isLocalAccountsDisabledError reports whether Azure refused to return the static admin credentials of a
+// cluster because it has local accounts disabled.
+func isLocalAccountsDisabledError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "disable local accounts")
 }
 
 func (h *Handler) buildUpstreamClusterState(ctx context.Context, credentials *aks.Credentials, spec *aksv1.AKSClusterConfigSpec) (*aksv1.AKSClusterConfigSpec, error) {
@@ -752,6 +784,22 @@ func (h *Handler) buildUpstreamClusterState(ctx context.Context, credentials *ak
 				upstreamSpec.UserAssignedIdentity = to.Ptr(userAssignedID)
 			}
 		}
+	}
+
+	// set Microsoft Entra ID profile
+	if aadProfile := clusterState.Properties.AADProfile; aadProfile != nil {
+		upstreamSpec.AADProfile = &aksv1.AKSAADProfile{
+			Managed:             aadProfile.Managed,
+			EnableAzureRBAC:     aadProfile.EnableAzureRBAC,
+			AdminGroupObjectIDs: utils.ConvertToPointerOfSlice(aadProfile.AdminGroupObjectIDs),
+			TenantID:            aadProfile.TenantID,
+		}
+	}
+
+	// set local accounts
+	upstreamSpec.DisableLocalAccounts = to.Ptr(false)
+	if clusterState.Properties.DisableLocalAccounts != nil {
+		upstreamSpec.DisableLocalAccounts = clusterState.Properties.DisableLocalAccounts
 	}
 
 	return upstreamSpec, err
